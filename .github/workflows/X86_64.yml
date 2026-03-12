@@ -1,0 +1,223 @@
+name: Build luci-app-backup for x86_64
+on: 
+  workflow_dispatch:  # 手动运行，不自动触发
+
+jobs:
+  build-x86:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      MAKE_JOBS: 4
+      SDK_URL: "https://immortalwrt.kyarucloud.moe/releases/24.10.4/targets/x86/64/immortalwrt-sdk-24.10.4-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+      # 核心依赖只保留关键项，其他依赖报错忽略
+      # MODIFIED: 改为 luci-app-backup 所需的依赖
+      CORE_DEPENDENCIES: "luci-app-backup"
+      # MODIFIED: 改为备份插件所需的依赖包
+      OTHER_DEPENDENCIES: "jsonfilter gnupg luci-lib-jsonc tar"
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 安装编译依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y build-essential libncurses5-dev gawk git wget unzip python3 python3-pip file rsync curl python3-pyelftools subversion time
+          sudo pip3 install pyelftools || true
+
+      - name: 3. 下载并解压 SDK
+        id: sdk
+        run: |
+          wget --timeout=60 --tries=3 $SDK_URL -O sdk.tar.xz || { echo "SDK 下载失败"; exit 1; }
+          tar xf sdk.tar.xz && mv $(find . -maxdepth 1 -type d -name "*sdk*" | head -1) openwrt-sdk
+          ls -la openwrt-sdk/
+
+      - name: 4. 准备插件文件
+        run: |
+          cd openwrt-sdk
+          # MODIFIED: 改为 luci-app-backup
+          rm -rf package/luci-app-backup && mkdir -p package/luci-app-backup
+          # MODIFIED: 复制备份插件文件（根据实际项目结构调整）
+          [ -f ../Makefile ] && cp ../Makefile package/luci-app-backup/
+          [ -d ../luasrc ] && cp -r ../luasrc package/luci-app-backup/
+          [ -d ../root ] && cp -r ../root package/luci-app-backup/
+          if [ -d ../files ]; then
+            mkdir -p package/luci-app-backup/root
+            cp -r ../files/* package/luci-app-backup/root/
+          fi
+          # MODIFIED: 检查是否有备份脚本目录
+          if [ -d ../etc/backup ]; then
+            mkdir -p package/luci-app-backup/root/etc/backup
+            cp -r ../etc/backup/* package/luci-app-backup/root/etc/backup/
+          fi
+          echo "==== 插件目录结构 ===="
+          find package/luci-app-backup -type d | sort | head -20
+
+      - name: 5. 强制更新并安装依赖源
+        run: |
+          cd openwrt-sdk
+          # 强制更新所有 feeds
+          ./scripts/feeds update -a -f
+          # MODIFIED: 安装备份插件所需的依赖
+          ./scripts/feeds install -f jsonfilter gnupg luci-lib-jsonc tar || true
+          # 安装其他 luci 相关依赖
+          ./scripts/feeds install luci-base luci-compat || true
+          echo "==== 已安装的 feeds ===="
+          ./scripts/feeds list | grep -E "luci|jsonfilter|gnupg|tar"
+
+      - name: 6. 生成配置
+        run: |
+          cd openwrt-sdk
+          cat > .config << EOF
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          
+          # MODIFIED: 启用备份插件
+          CONFIG_PACKAGE_luci-app-backup=y
+          
+          # MODIFIED: 启用备份插件依赖
+          CONFIG_PACKAGE_jsonfilter=y
+          CONFIG_PACKAGE_gnupg=y
+          CONFIG_PACKAGE_luci-lib-jsonc=y
+          CONFIG_PACKAGE_tar=y
+          
+          # 可选：启用加密相关功能
+          CONFIG_PACKAGE_libopenssl=y
+          CONFIG_PACKAGE_gpg=y
+          EOF
+          make defconfig
+          echo "==== 配置摘要 ===="
+          grep -E "CONFIG_TARGET|CONFIG_PACKAGE" .config | grep -E "backup|jsonfilter|gnupg|luci|tar"
+
+      - name: 7. 编译其他依赖（失败忽略）
+        run: |
+          cd openwrt-sdk
+          # MODIFIED: 编译备份插件依赖
+          for pkg in jsonfilter gnupg luci-lib-jsonc tar; do
+            echo "==== 编译 $pkg（失败忽略） ===="
+            pkg_path=$(find package feeds -name $pkg -type d | head -1)
+            if [ -n "$pkg_path" ]; then
+              make package/$pkg/compile V=sc -j$MAKE_JOBS || echo "⚠ $pkg 编译失败，跳过"
+            else
+              echo "⚠ $pkg 在 feeds 中未找到，跳过"
+            fi
+          done
+
+      - name: 8. 编译主插件
+        run: |
+          cd openwrt-sdk
+          # MODIFIED: 编译 luci-app-backup 主插件
+          echo "==== 编译 luci-app-backup ===="
+          [ ! -d "package/luci-app-backup" ] && { echo "插件目录缺失"; exit 1; }
+          make package/luci-app-backup/clean
+          make package/luci-app-backup/compile V=s -j$MAKE_JOBS 2>&1 | tee plugin-compile-log.txt
+          MAIN_IPK=$(find bin -name "*luci-app-backup*.ipk" -type f | head -1)
+          if [ -z "$MAIN_IPK" ]; then
+            echo "==== 主插件编译日志（最后100行）===="
+            tail -100 plugin-compile-log.txt
+            echo "❌ 主插件编译失败"
+            exit 1
+          else
+            echo "✅ 主插件编译成功: $MAIN_IPK"
+          fi
+
+      - name: 9. 调试 - 查找所有编译输出
+        run: |
+          cd openwrt-sdk
+          echo "==== 搜索所有 IPK 文件 ===="
+          find . -name "*.ipk" -type f 2>/dev/null | sort
+          
+          echo "==== 查看 bin 目录结构 ===="
+          find bin -type f 2>/dev/null | head -30
+          
+          echo "==== 查看备份插件相关 IPK ===="
+          find bin/packages -name "*backup*.ipk" 2>/dev/null || echo "未找到备份插件 IPK"
+          
+          echo "==== 检查编译日志中的错误 ===="
+          grep -i "error\|failed\|cannot\|undefined" plugin-compile-log.txt 2>/dev/null | head -20 || true
+
+      - name: 10. 收集编译产物
+        run: |
+          cd openwrt-sdk
+          
+          mkdir -p ../output-x86_64
+          
+          # MODIFIED: 复制主插件 IPK
+          MAIN_IPK=$(find bin -name "*luci-app-backup*.ipk" -type f | head -1)
+          if [ -n "$MAIN_IPK" ]; then
+            cp "$MAIN_IPK" ../output-x86_64/
+            echo "✅ 已复制主插件: $(basename $MAIN_IPK)"
+          fi
+          
+          # MODIFIED: 复制备份脚本（可选）
+          if [ -d "package/luci-app-backup/root/etc/backup" ]; then
+            mkdir -p ../output-x86_64/scripts
+            cp -r package/luci-app-backup/root/etc/backup/* ../output-x86_64/scripts/ 2>/dev/null || true
+            echo "✅ 已复制备份脚本"
+          fi
+          
+          # 复制相关依赖 IPK（可选）
+          for pkg in jsonfilter gnupg luci-lib-jsonc tar; do
+            IPK_PATH=$(find bin -name "*$pkg*.ipk" -type f | head -1)
+            if [ -n "$IPK_PATH" ]; then
+              cp "$IPK_PATH" ../output-x86_64/
+              echo "已复制依赖: $(basename $IPK_PATH)"
+            fi
+          done
+          
+          echo "==== 输出目录内容 ===="
+          ls -lh ../output-x86_64/
+
+      - name: 11. 清理缓存
+        run: |
+          echo "==== 开始清理缓存 ===="
+          cd openwrt-sdk
+          make clean || echo "清理失败，继续执行"
+          rm -rf dl/* build_dir/* staging_dir/* tmp/* 2>/dev/null || true
+          rm -f plugin-compile-log.txt 2>/dev/null || true
+          echo "清理完成，剩余空间:"
+          df -h
+
+      - name: 12. 上传编译产物
+        uses: actions/upload-artifact@v4
+        with:
+          # MODIFIED: 修改 artifact 名称
+          name: luci-app-backup-x86_64
+          path: output-x86_64/
+          retention-days: 7
+
+      - name: 13. 构建报告
+        if: always()
+        run: |
+          echo "========================================"
+          echo "构建状态报告 - luci-app-backup for x86_64"
+          echo "========================================"
+          echo "架构：x86_64 (64位)"
+          echo "SDK版本：ImmortalWrt 24.10.4"
+          echo "作业状态: ${{ job.status }}"
+          echo "SDK 下载状态: ${{ steps.sdk.outcome }}"
+          echo ""
+          if [ -d output-x86_64 ]; then
+            IPK_COUNT=$(find output-x86_64 -name "*.ipk" 2>/dev/null | wc -l)
+            echo "📦 生成的 IPK 数量: $IPK_COUNT"
+            echo "📋 IPK 列表:"
+            ls -lh output-x86_64/
+            
+            # MODIFIED: 检查主插件
+            MAIN_IPK=$(find output-x86_64 -name "*luci-app-backup*.ipk" 2>/dev/null | head -1)
+            
+            if [ -n "$MAIN_IPK" ]; then
+              echo "✅ 主插件: $(basename $MAIN_IPK)"
+              echo "📊 文件大小: $(du -h $MAIN_IPK | cut -f1)"
+            else
+              echo "❌ 主插件编译失败"
+            fi
+            
+            # MODIFIED: 检查备份脚本
+            if [ -d output-x86_64/scripts ]; then
+              echo "✅ 备份脚本已包含"
+              ls -la output-x86_64/scripts/
+            fi
+          else
+            echo "❌ 输出目录不存在"
+          fi
