@@ -2,7 +2,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI support for Backup and Restore
-LUCI_DEPENDS:=+jsonfilter +gpg +luci-lib-jsonc
+LUCI_DEPENDS:=+jsonfilter +gnupg +luci-lib-jsonc
 LUCI_PKGARCH:=all
 
 PKG_NAME:=luci-app-backup
