@@ -327,8 +327,8 @@ function startBackup() {
                     
                     var encrypt = document.getElementById('enable_encrypt').checked;
                     if (encrypt) {
-                        resultHtml += '<%:加密方式：%> GPG AES256 <%:加密%>\n';
-                        resultHtml += '<%:密码文件：%> /usr/bin/backup-password\n';
+                        resultHtml += '🔐<%:加密方式：%> GPG AES256 <%:加密%>\n';
+                        resultHtml += '🔑<%:密码文件：%> /usr/bin/backup-password\n';
                     }
                     
                     resultContent.innerHTML = resultHtml.replace(/\n/g, '<br>');
